@@ -18,11 +18,11 @@
 # the starting corpus. This has two uses:
 #
 #   - Screening large corpora of input files before using them as a seed for
-#     afl-fuzz. The tool will remove functionally redundant files and likely
-#     leave you with a much smaller set.
+#     seed for afl-fuzz. The tool effectively reject functionally redundant
+#     files and likely leave you with a much smaller set.
 #
 #     (In this case, you probably also want to consider running afl-tmin on
-#     the individual files later on to reduce their size.)
+#     the individual files to reduce their size.)
 #
 #   - Minimizing the corpus generated organically by afl-fuzz, perhaps when
 #     planning to feed it to more resource-intensive tools. The tool achieves
@@ -49,9 +49,9 @@ MEM_LIMIT=100
 TIMEOUT=none
 
 unset IN_DIR OUT_DIR STDIN_FILE EXTRA_PAR MEM_LIMIT_GIVEN \
-  AFL_CMIN_CRASHES_ONLY AFL_CMIN_ALLOW_ANY QEMU_MODE
+  AFL_CMIN_CRASHES_ONLY AFL_CMIN_ALLOW_ANY QEMU_MODE CLOBBER
 
-while getopts "+i:o:f:m:t:eQC" opt; do
+while getopts "+i:o:f:m:t:eXQC" opt; do
 
   case "$opt" in 
 
@@ -74,6 +74,9 @@ while getopts "+i:o:f:m:t:eQC" opt; do
          ;;
     "e")
          EXTRA_PAR="$EXTRA_PAR -e"
+         ;;
+    "X")
+         CLOBBER=1
          ;;
     "C")
          export AFL_CMIN_CRASHES_ONLY=1
@@ -111,6 +114,7 @@ Execution control settings:
   -m megs       - memory limit for child process ($MEM_LIMIT MB)
   -t msec       - run time limit for child process (none)
   -Q            - use binary-only instrumentation (QEMU mode)
+  -X		- clobber the output directory without confirmation
 
 Minimization settings:
 
@@ -208,14 +212,19 @@ fi
 
 test -d "$IN_DIR/queue" && IN_DIR="$IN_DIR/queue"
 
-find "$OUT_DIR" -name 'id[:_]*' -maxdepth 1 -exec rm -- {} \; 2>/dev/null
+#find "$OUT_DIR" -name 'id[:_]*' -maxdepth 1 -exec rm -- {} \; 2>/dev/null
 rm -rf "$TRACE_DIR" 2>/dev/null
 
-rmdir "$OUT_DIR" 2>/dev/null
-
-if [ -d "$OUT_DIR" ]; then
-  echo "[-] Error: directory '$OUT_DIR' exists and is not empty - delete it first." 1>&2
-  exit 1
+if [ "$CLOBBER" = "" ]; then
+  rmdir "$OUT_DIR" 2>/dev/null
+  
+  if [ -d "$OUT_DIR" ]; then
+    echo "[-] Error: directory '$OUT_DIR' exists and is not empty - delete it first." 1>&2
+    exit 1
+  fi
+else
+  echo "[*] Clobber mode - deleting -o target '$OUT_DIR' ..." 1>&2
+  rm -rf "$OUT_DIR" 2>/dev/null
 fi
 
 mkdir -m 700 -p "$TRACE_DIR" || exit 1
@@ -260,7 +269,7 @@ echo "[*] Testing the target binary..."
 
 if [ "$STDIN_FILE" = "" ]; then
 
-  AFL_CMIN_ALLOW_ANY=1 "$SHOWMAP" -m "$MEM_LIMIT" -t "$TIMEOUT" -o "$TRACE_DIR/.run_test" -Z $EXTRA_PAR -- "$@" <"$IN_DIR/$FIRST_FILE"
+  AFL_CMIN_ALLOW_ANY=1 "$SHOWMAP" -m "$MEM_LIMIT" -t "$TIMEOUT" -o "$TRACE_DIR/.run_test" -Z $EXTRA_PAR -- "$@" <"$IN_DIR/$fn"
 
 else
 
@@ -290,40 +299,43 @@ fi
 #############################
 
 echo "[*] Obtaining traces for input files in '$IN_DIR'..."
+#
+#(
+#
+#  CUR=0
+#
+#  if [ "$STDIN_FILE" = "" ]; then
+#
+#    while read -r fn; do
+#
+#      CUR=$((CUR+1))
+#      printf "\\r    Processing file $CUR/$IN_COUNT... "
+#
+#      "$SHOWMAP" -m "$MEM_LIMIT" -t "$TIMEOUT" -o "$TRACE_DIR/$fn" -Z $EXTRA_PAR -- "$@" <"$IN_DIR/$fn"
+#
+#    done < <(ls "$IN_DIR")
+#
+#  else
+#
+#    while read -r fn; do
+#
+#      CUR=$((CUR+1))
+#      printf "\\r    Processing file $CUR/$IN_COUNT... "
+#
+#      cp "$IN_DIR/$fn" "$STDIN_FILE"
+#
+#      "$SHOWMAP" -m "$MEM_LIMIT" -t "$TIMEOUT" -o "$TRACE_DIR/$fn" -Z $EXTRA_PAR -A "$STDIN_FILE" -- "$@" </dev/null
+#
+#    done < <(ls "$IN_DIR")
+#
+#
+#  fi
+#
+#)
 
-(
-
-  CUR=0
-
-  if [ "$STDIN_FILE" = "" ]; then
-
-    while read -r fn; do
-
-      CUR=$((CUR+1))
-      printf "\\r    Processing file $CUR/$IN_COUNT... "
-
-      "$SHOWMAP" -m "$MEM_LIMIT" -t "$TIMEOUT" -o "$TRACE_DIR/$fn" -Z $EXTRA_PAR -- "$@" <"$IN_DIR/$fn"
-
-    done < <(ls "$IN_DIR")
-
-  else
-
-    while read -r fn; do
-
-      CUR=$((CUR+1))
-      printf "\\r    Processing file $CUR/$IN_COUNT... "
-
-      cp "$IN_DIR/$fn" "$STDIN_FILE"
-
-      "$SHOWMAP" -m "$MEM_LIMIT" -t "$TIMEOUT" -o "$TRACE_DIR/$fn" -Z $EXTRA_PAR -A "$STDIN_FILE" -- "$@" </dev/null
-
-    done < <(ls "$IN_DIR")
-
-
-  fi
-
-)
-
+find "$IN_DIR" -maxdepth 1 -type f -print0 | parallel -0 "$SHOWMAP" -m "$MEM_LIMIT" -t "$TIMEOUT" \
+  -o "$TRACE_DIR"/{/} -Z $EXTRA_PAR -A {} -- "$@"
+ 
 echo
 
 ##########################
@@ -337,8 +349,10 @@ echo
 
 echo "[*] Sorting trace sets (this may take a while)..."
 
-ls "$IN_DIR" | sed "s#^#$TRACE_DIR/#" | tr '\n' '\0' | xargs -0 -n 1 cat | \
-  sort | uniq -c | sort -n >"$TRACE_DIR/.all_uniq"
+#ls "$IN_DIR" | sed "s#^#$TRACE_DIR/#" | tr '\n' '\0' | xargs -0 -n 1 cat | \
+# sort | uniq -c | sort -n >"$TRACE_DIR/.all_uniq"
+
+find "$IN_DIR" -maxdepth 1 -type f -print0 | parallel -0 cat "$TRACE_DIR"/{/} | sort | uniq -c | sort -n >"$TRACE_DIR/.all_uniq"
 
 TUPLE_COUNT=$((`grep -c . "$TRACE_DIR/.all_uniq"`))
 
@@ -355,17 +369,19 @@ echo "[+] Found $TUPLE_COUNT unique tuples across $IN_COUNT files."
 # a shell script.
 
 echo "[*] Finding best candidates for each tuple..."
+#
+#CUR=0
+#
+#while read -r fn; do
+#
+#  CUR=$((CUR+1))
+#  printf "\\r    Processing file $CUR/$IN_COUNT... "
+#
+#  sed "s#\$# $fn#" "$TRACE_DIR/$fn" >>"$TRACE_DIR/.candidate_list"
+#
+#done < <(ls -rS "$IN_DIR")
 
-CUR=0
-
-while read -r fn; do
-
-  CUR=$((CUR+1))
-  printf "\\r    Processing file $CUR/$IN_COUNT... "
-
-  sed "s#\$# $fn#" "$TRACE_DIR/$fn" >>"$TRACE_DIR/.candidate_list"
-
-done < <(ls -rS "$IN_DIR")
+ls -rS "$IN_DIR" | parallel -k -I FN sed "s^\$^\ FN^" "$TRACE_DIR/FN" >> "$TRACE_DIR/.candidate_list"
 
 echo
 
@@ -408,6 +424,12 @@ echo "[*] Processing candidates and writing output files..."
 CUR=0
 
 touch "$TRACE_DIR/.already_have"
+if [ -f "$TRACE_DIR/.already_have" ]; then
+  echo "Touch ok"
+else
+  echo "[-] Failed to touch '$TRACE_DIR/.already_have' - aborting"
+  exit 1
+fi
 
 while read -r cnt tuple; do
 
